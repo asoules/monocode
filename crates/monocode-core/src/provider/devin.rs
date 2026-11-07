@@ -1,8 +1,9 @@
-//! Supervised Devin sessions. Devin's ACP server has no mode that asks before
-//! workspace edits, but its permission rules can: the child runs with a copy of
-//! the user's config whose `ask` list also covers every write. `--config`
-//! replaces the user config rather than layering on it, so the copy keeps the
-//! user's own settings.
+//! Supervised and read-only Devin sessions. Devin's ACP server has no mode
+//! that asks before workspace edits and no read-only mode except plan, but
+//! its permission rules can do both: the child runs with a copy of the user's
+//! config whose `permissions` lists also cover every write (`ask` for
+//! Supervised, `deny` for read-only). `--config` replaces the user config
+//! rather than layering on it, so the copy keeps the user's own settings.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -24,12 +25,22 @@ pub(crate) const ASK_EDITS_RULE: &str = "Write(**)";
 /// The `--config` arguments for a supervised `devin acp` child.
 pub(super) fn supervised_args() -> Result<Vec<String>, String> {
     let config = ask_before_edits(read_user_config()?.as_deref())?;
+    config_args("supervised", &config)
+}
+
+/// The `--config` arguments for a read-only `devin acp` child.
+pub(super) fn read_only_args() -> Result<Vec<String>, String> {
+    let config = read_only_config(read_user_config()?.as_deref())?;
+    config_args("read-only", &config)
+}
+
+fn config_args(name: &str, config: &str) -> Result<Vec<String>, String> {
     let dir = std::env::var_os("MONOCODE_NATIVE_DATA_DIR")
         .map(PathBuf::from)
         .or_else(|| dirs_home().map(|home| PathBuf::from(home).join(".cache/monocode-native")))
-        .ok_or("No user data directory available for Devin's supervised config")?
+        .ok_or_else(|| format!("No user data directory available for Devin's {name} config"))?
         .join("devin");
-    let path = write_once(&dir, &config)?;
+    let path = write_once(&dir, name, config)?;
     Ok(vec!["--config".into(), path.to_string_lossy().into_owned()])
 }
 
@@ -607,39 +618,89 @@ fn read_user_config() -> Result<Option<String>, String> {
 /// The user's config with an `ask` rule for every write. Anything it cannot
 /// extend safely is an error: Supervised must not start without the rule.
 pub(crate) fn ask_before_edits(user: Option<&str>) -> Result<String, String> {
-    const HELP: &str = "Supervised mode needs it to make Devin ask before edits.";
+    with_rules(
+        user,
+        "Supervised mode needs it to make Devin ask before edits.",
+        &[("ask", &[ASK_EDITS_RULE])],
+    )
+}
+
+/// Read-only shell commands a read-only session may run, matching Claude's
+/// read-only `--allowedTools`. Devin's `Exec` prefixes match whole words.
+pub(crate) const READ_ONLY_COMMANDS: [&str; 7] = [
+    "Exec(git status)",
+    "Exec(git diff)",
+    "Exec(git log)",
+    "Exec(git show)",
+    "Exec(pwd)",
+    "Exec(ls)",
+    "Exec(rg)",
+];
+
+/// The user's config with the read-only rules. Devin has no read-only ACP
+/// mode other than plan, so a read-only session runs in accept-edits under
+/// these rules: every edit and write is denied (a deny beats any allow and any
+/// mode), shell commands ask (the client denies the request in read-only)
+/// except the read-only commands above, and MonoCode's own MCP tools run.
+/// Reads and searches are Devin's own auto-approved tools.
+pub(crate) fn read_only_config(user: Option<&str>) -> Result<String, String> {
+    let mut allow: Vec<&str> = READ_ONLY_COMMANDS.to_vec();
+    allow.extend(["mcp__monocode_app__*", "mcp__monocode_visual__*"]);
+    with_rules(
+        user,
+        "Read-only mode needs it to stop Devin writing files.",
+        &[
+            ("deny", &["edit", ASK_EDITS_RULE]),
+            ("ask", &["exec"]),
+            ("allow", &allow),
+        ],
+    )
+}
+
+/// The user's config with `rules` added to its `permissions` lists.
+fn with_rules(user: Option<&str>, help: &str, rules: &[(&str, &[&str])]) -> Result<String, String> {
     let mut config = match user.map(str::trim).filter(|text| !text.is_empty()) {
         Some(text) => {
             let cleaned = strip_jsonc_comments(text).ok_or_else(|| {
-                format!("Devin's config.json has an unterminated comment. {HELP}")
+                format!("Devin's config.json has an unterminated comment. {help}")
             })?;
             serde_json::from_str::<Value>(&cleaned)
-                .map_err(|e| format!("Devin's config.json is not valid JSON ({e}). {HELP}"))?
+                .map_err(|e| format!("Devin's config.json is not valid JSON ({e}). {help}"))?
         }
         None => json!({}),
     };
-    let ask = config
+    let permissions = config
         .as_object_mut()
-        .ok_or_else(|| format!("Devin's config.json is not a JSON object. {HELP}"))?
+        .ok_or_else(|| format!("Devin's config.json is not a JSON object. {help}"))?
         .entry("permissions")
         .or_insert_with(|| json!({}))
         .as_object_mut()
-        .ok_or_else(|| format!("Devin's config.json `permissions` is not an object. {HELP}"))?
-        .entry("ask")
-        .or_insert_with(|| json!([]))
-        .as_array_mut()
-        .ok_or_else(|| format!("Devin's config.json `permissions.ask` is not a list. {HELP}"))?;
-    if !ask.iter().any(|rule| rule.as_str() == Some(ASK_EDITS_RULE)) {
-        ask.push(json!(ASK_EDITS_RULE));
+        .ok_or_else(|| format!("Devin's config.json `permissions` is not an object. {help}"))?;
+    for (list, added) in rules {
+        let list_rules = permissions
+            .entry(*list)
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .ok_or_else(|| {
+                format!("Devin's config.json `permissions.{list}` is not a list. {help}")
+            })?;
+        for rule in *added {
+            if !list_rules
+                .iter()
+                .any(|existing| existing.as_str() == Some(rule))
+            {
+                list_rules.push(json!(rule));
+            }
+        }
     }
     serde_json::to_string_pretty(&config).map_err(|e| e.to_string())
 }
 
 /// Named by content so a running child's file is never rewritten in place.
-fn write_once(dir: &Path, contents: &str) -> Result<PathBuf, String> {
+fn write_once(dir: &Path, name: &str, contents: &str) -> Result<PathBuf, String> {
     let mut hasher = DefaultHasher::new();
     contents.hash(&mut hasher);
-    let path = dir.join(format!("supervised-{:016x}.json", hasher.finish()));
+    let path = dir.join(format!("{name}-{:016x}.json", hasher.finish()));
     if path.is_file() {
         return Ok(path);
     }
@@ -772,10 +833,48 @@ mod tests {
     fn writes_each_config_once_by_content() {
         let dir =
             std::env::temp_dir().join(format!("monocode-devin-config-{}", std::process::id()));
-        let first = write_once(&dir, "{}").unwrap();
-        assert_eq!(write_once(&dir, "{}").unwrap(), first);
+        let first = write_once(&dir, "supervised", "{}").unwrap();
+        assert_eq!(write_once(&dir, "supervised", "{}").unwrap(), first);
         assert_eq!(std::fs::read_to_string(&first).unwrap(), "{}");
-        assert_ne!(write_once(&dir, "{\"a\":1}").unwrap(), first);
+        assert_ne!(write_once(&dir, "supervised", "{\"a\":1}").unwrap(), first);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_only_denies_every_write_and_pre_approves_only_reads() {
+        let config = read_only_config(Some(
+            r#"{"theme_mode":"dark","permissions":{"allow":["Exec(python3)"],"deny":["Exec(rm)"]}}"#,
+        ))
+        .unwrap();
+        let value: Value = serde_json::from_str(&config).unwrap();
+        let list = |name: &str| -> Vec<String> {
+            value["permissions"][name]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|rule| rule.as_str().unwrap().to_owned())
+                .collect()
+        };
+        assert_eq!(value["theme_mode"], "dark");
+        assert_eq!(list("deny"), ["Exec(rm)", "edit", ASK_EDITS_RULE]);
+        assert_eq!(list("ask"), ["exec"]);
+        let allow = list("allow");
+        assert_eq!(allow[0], "Exec(python3)", "keeps the user's rules first");
+        for rule in READ_ONLY_COMMANDS
+            .iter()
+            .copied()
+            .chain(["mcp__monocode_app__*", "mcp__monocode_visual__*"])
+        {
+            assert!(allow.iter().any(|r| r == rule), "{rule} allowed: {allow:?}");
+        }
+        for rule in ["edit", "exec", "Write(**)", "Exec(rm)"] {
+            assert!(
+                !allow.iter().any(|r| r == rule),
+                "{rule} must not be allowed"
+            );
+        }
+        // Applying it twice adds nothing, and broken configs refuse to start.
+        assert_eq!(read_only_config(Some(&config)).unwrap(), config);
+        assert!(read_only_config(Some(r#"{"permissions":{"deny":"edit"}}"#)).is_err());
     }
 }

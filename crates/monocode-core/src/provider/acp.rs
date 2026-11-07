@@ -48,6 +48,54 @@ pub(super) struct State {
     mode: Option<&'static str>,
 }
 
+/// Read-only Bash commands Grok may run in a read-only session, matching
+/// Claude's read-only `--allowedTools`.
+const GROK_READ_ONLY_COMMANDS: [&str; 7] = [
+    "Bash(git status *)",
+    "Bash(git diff *)",
+    "Bash(git log *)",
+    "Bash(git show *)",
+    "Bash(pwd)",
+    "Bash(ls *)",
+    "Bash(rg *)",
+];
+
+/// Grok's permission mode and rules (top-level flags, before `agent`).
+///
+/// Read-only is not Grok's plan mode: plan mode is the separate `/plan`
+/// feature (`settings.plan`), and it lets shell and other tools run after
+/// approval. A read-only session runs in Grok's `dontAsk` mode, which runs
+/// only Grok's built-in read-only tools and shell commands plus pre-approved
+/// tools and denies everything else without asking: file edits, other shell
+/// commands, web fetches and unlisted MCP tools. The read-only commands and
+/// MonoCode's own MCP servers are pre-approved, and `mkdir`/`touch`, which
+/// Grok counts as read-only, are denied. The OS sandbox's `read-only`
+/// profile is not used: on Linux it blocks child-process network access,
+/// which MonoCode's MCP servers need to reach the app over loopback.
+fn configure_grok_access(command: &mut Command, settings: &Settings) {
+    let read_only = settings.access == AccessMode::ReadOnly;
+    if settings.plan {
+        command.args(["--permission-mode", "plan"]);
+    } else if read_only {
+        command.args(["--permission-mode", "dontAsk"]);
+    }
+    if !read_only {
+        return;
+    }
+    for rule in GROK_READ_ONLY_COMMANDS {
+        command.args(["--allow", rule]);
+    }
+    if crate::visual_bridge::configured(&settings.environment) {
+        command.args(["--allow", crate::visual_bridge::CLAUDE_ALLOWED_TOOLS]);
+    }
+    if crate::mono::bridge::acp_server(settings.mono.as_ref(), &settings.environment).is_some() {
+        command.args(["--allow", crate::mono::bridge::CLAUDE_ALLOWED_TOOLS]);
+    }
+    for rule in ["Bash(mkdir)", "Bash(touch)"] {
+        command.args(["--deny", rule]);
+    }
+}
+
 pub(super) fn configure(command: &mut Command, request: &Request) -> Result<(), String> {
     let settings = &request.settings;
     match request.kind {
@@ -58,9 +106,7 @@ pub(super) fn configure(command: &mut Command, request: &Request) -> Result<(), 
         }
         Kind::Grok => {
             command.arg("--no-auto-update");
-            if settings.plan || settings.access == AccessMode::ReadOnly {
-                command.args(["--permission-mode", "plan"]);
-            }
+            configure_grok_access(command, settings);
             command.args(["agent", "--no-leader"]);
             if let Some(model) = &request.model {
                 command.args(["--model", model]);
@@ -75,7 +121,9 @@ pub(super) fn configure(command: &mut Command, request: &Request) -> Result<(), 
             command.env("GROK_NO_AUTO_UPDATE", "1");
         }
         Kind::Devin => {
-            if settings.access == AccessMode::Supervised {
+            if settings.access == AccessMode::ReadOnly {
+                command.args(super::devin::read_only_args()?);
+            } else if settings.access == AccessMode::Supervised {
                 command.args(super::devin::supervised_args()?);
             }
             command.arg("acp");
@@ -353,8 +401,11 @@ impl Protocol {
                     }
                 }
             }
+            // Devin's ACP modes are plan, accept-edits, smart and bypass.
+            // Read-only is accept-edits under a config that denies every
+            // write (`devin::read_only_args`); only `settings.plan` plans.
             Kind::Devin => {
-                if planning {
+                if settings.plan {
                     "plan"
                 } else {
                     match settings.access {
@@ -1698,6 +1749,134 @@ mod tests {
             let mut out = Vec::new();
             let events = p.frame(json!({"id":"permission","method":"session/request_permission","params":{"toolCall":{"kind":"execute"},"options":[{"kind":"allow_once","optionId":"yes"},{"kind":"reject_once","optionId":"no"}]}}), &mut out).unwrap();
             assert!(events.is_empty());
+            assert_eq!(last(&mut out)["result"]["outcome"]["optionId"], "no");
+        }
+    }
+    fn args(command: &Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+    fn flag_values<'a>(args: &'a [String], name: &str) -> Vec<&'a str> {
+        args.windows(2)
+            .filter(|pair| pair[0] == name)
+            .map(|pair| pair[1].as_str())
+            .collect()
+    }
+    /// A read-only Mono session's settings with the app and visual bridges.
+    fn bridged(access: AccessMode) -> crate::agent::Settings {
+        let mut settings = crate::agent::Settings {
+            access,
+            mono: Some(crate::agent::MonoContext {
+                mono: Default::default(),
+                root: "/monos".into(),
+                executable: "/bin/monocode-gpui".into(),
+            }),
+            ..Default::default()
+        };
+        for key in [
+            "MONOCODE_APP_ENDPOINT",
+            "MONOCODE_APP_TOKEN",
+            "MONOCODE_APP_SESSION",
+            "MONOCODE_VISUAL_ENDPOINT",
+            "MONOCODE_VISUAL_TOKEN",
+            "MONOCODE_VISUAL_SESSION",
+            "MONOCODE_VISUAL_EXECUTABLE",
+        ] {
+            settings.environment.insert(key.into(), "set".into());
+        }
+        settings
+    }
+    #[test]
+    fn read_only_grok_uses_dont_ask_with_read_only_rules_not_plan() {
+        // Regression: read-only passed --permission-mode plan, which lets
+        // shell and other tools run after approval and asks before MonoCode's
+        // own MCP tools, which read-only then denied.
+        let mut p = protocol(Kind::Grok);
+        p.request.settings = bridged(AccessMode::ReadOnly);
+        let mut command = Command::new("grok");
+        configure(&mut command, &p.request).unwrap();
+        let args = args(&command);
+        assert_eq!(flag_values(&args, "--permission-mode"), ["dontAsk"]);
+        let allowed = flag_values(&args, "--allow");
+        for rule in GROK_READ_ONLY_COMMANDS
+            .iter()
+            .copied()
+            .chain(["mcp__monocode_app", "mcp__monocode_visual"])
+        {
+            assert!(allowed.contains(&rule), "{rule} allowed: {allowed:?}");
+        }
+        for rule in ["Bash", "Edit", "Write", "WebFetch"] {
+            assert!(!allowed.contains(&rule), "{rule} must not be allowed");
+        }
+        assert_eq!(flag_values(&args, "--deny"), ["Bash(mkdir)", "Bash(touch)"]);
+        assert!(!args.iter().any(|arg| arg == "--always-approve"));
+        // Permission flags are Grok's top-level options, before `agent`.
+        let agent = args.iter().position(|arg| arg == "agent").unwrap();
+        assert!(args.iter().rposition(|arg| arg == "--deny").unwrap() < agent);
+    }
+    #[test]
+    fn only_the_users_plan_choice_selects_grok_plan_mode() {
+        for access in [
+            AccessMode::ReadOnly,
+            AccessMode::Supervised,
+            AccessMode::AutoAcceptEdits,
+            AccessMode::Auto,
+            AccessMode::FullAccess,
+        ] {
+            let mut p = protocol(Kind::Grok);
+            p.request.settings = bridged(access);
+            let mut command = Command::new("grok");
+            configure(&mut command, &p.request).unwrap();
+            assert!(
+                !flag_values(&args(&command), "--permission-mode").contains(&"plan"),
+                "{access:?}"
+            );
+            p.request.settings.plan = true;
+            let mut command = Command::new("grok");
+            configure(&mut command, &p.request).unwrap();
+            let planned = args(&command);
+            assert_eq!(
+                flag_values(&planned, "--permission-mode"),
+                ["plan"],
+                "{access:?}"
+            );
+            // Read-only's rules still hold while planning; other modes add none.
+            assert_eq!(
+                flag_values(&planned, "--allow").is_empty(),
+                access != AccessMode::ReadOnly,
+                "{access:?}"
+            );
+        }
+    }
+    #[test]
+    fn read_only_devin_runs_accept_edits_not_plan() {
+        // Read-only Devin runs under `devin::read_only_config`'s deny rules.
+        for (access, plan, mode) in [
+            (AccessMode::ReadOnly, false, "accept-edits"),
+            (AccessMode::ReadOnly, true, "plan"),
+            (AccessMode::Supervised, false, "accept-edits"),
+            (AccessMode::Supervised, true, "plan"),
+            (AccessMode::FullAccess, false, "bypass"),
+        ] {
+            let mut p = protocol(Kind::Devin);
+            p.request.settings.access = access;
+            p.request.settings.plan = plan;
+            p.acp.session = "saved".into();
+            p.acp_options(&json!({})).unwrap();
+            assert_eq!(p.acp.mode, Some(mode), "{access:?} plan={plan}");
+        }
+    }
+    #[test]
+    fn read_only_acp_still_denies_commands_that_reach_the_client() {
+        for kind in [Kind::Grok, Kind::Devin] {
+            let mut p = protocol(kind);
+            p.request.settings = bridged(AccessMode::ReadOnly);
+            p.acp.stage = Stage::Prompt;
+            let mut out = Vec::new();
+            let events = p.frame(json!({"id":"permission","method":"session/request_permission","params":{"toolCall":{"kind":"execute"},"options":[{"kind":"allow_once","optionId":"yes"},{"kind":"reject_once","optionId":"no"}]}}), &mut out).unwrap();
+            assert!(events.is_empty(), "{kind:?}");
             assert_eq!(last(&mut out)["result"]["outcome"]["optionId"], "no");
         }
     }

@@ -440,25 +440,9 @@ impl State {
                         .as_str()
                         .or_else(|| permission["action"].as_str())
                         .unwrap_or("tool");
-                    let planning = self.protocol.request.settings.plan
-                        || self.protocol.request.settings.access == AccessMode::ReadOnly;
-                    if planning
-                        || self.protocol.request.settings.access == AccessMode::FullAccess
-                        || !interactive
+                    if let Some(allow) =
+                        auto_permission(&self.protocol.request.settings, action, interactive)
                     {
-                        let action = action.to_lowercase();
-                        let writing = ["bash", "command", "shell", "edit", "write", "patch"]
-                            .iter()
-                            .any(|kind| action.contains(kind));
-                        let reading = ["read", "grep", "glob", "search", "find"]
-                            .iter()
-                            .any(|kind| action.contains(kind));
-                        let allow = if planning {
-                            !writing && reading
-                        } else {
-                            interactive
-                                && self.protocol.request.settings.access == AccessMode::FullAccess
-                        };
                         client.permission(&session, id, allow)?;
                     } else {
                         let ui = format!("opencode-permission-{id}");
@@ -918,4 +902,163 @@ pub(super) fn error_message(value: &Value) -> String {
         .or_else(|| value["error"]["message"].as_str())
         .unwrap_or("OpenCode session failed.")
         .into()
+}
+
+/// How a permission request is answered without asking, or `None` to show it.
+///
+/// Plan mode and read-only both answer for the user: only a request that
+/// reads or searches, and never one that runs a shell or writes, is allowed.
+/// Read-only gets there through its session ruleset (`client::permissions`),
+/// not through OpenCode's `plan` agent. Full access allows everything a user
+/// could see; a hidden session denies what it cannot show.
+pub(super) fn auto_permission(
+    settings: &Settings,
+    action: &str,
+    interactive: bool,
+) -> Option<bool> {
+    let restricted = settings.plan || settings.access == AccessMode::ReadOnly;
+    if !restricted && settings.access != AccessMode::FullAccess && interactive {
+        return None;
+    }
+    if restricted {
+        let action = action.to_lowercase();
+        let writing = ["bash", "command", "shell", "edit", "write", "patch"]
+            .iter()
+            .any(|kind| action.contains(kind));
+        let reading = ["read", "grep", "glob", "search", "find", "list"]
+            .iter()
+            .any(|kind| action.contains(kind));
+        return Some(!writing && reading);
+    }
+    Some(interactive && settings.access == AccessMode::FullAccess)
+}
+
+#[cfg(test)]
+mod read_only_tests {
+    use super::super::client::{permissions, prompt_agent, READ_ONLY_COMMANDS};
+    use super::*;
+
+    const ACCESS: [AccessMode; 5] = [
+        AccessMode::ReadOnly,
+        AccessMode::Supervised,
+        AccessMode::AutoAcceptEdits,
+        AccessMode::Auto,
+        AccessMode::FullAccess,
+    ];
+    fn settings(access: AccessMode, plan: bool) -> Settings {
+        Settings {
+            access,
+            plan,
+            ..Default::default()
+        }
+    }
+    /// The last rule matching `(permission, pattern)` exactly, as OpenCode
+    /// applies the last match.
+    fn effect(rules: &Value, v2: bool, permission: &str, pattern: &str) -> Option<String> {
+        let (rows, name, resource, action) = if v2 {
+            (&rules["permissions"], "action", "resource", "effect")
+        } else {
+            (&rules["permission"], "permission", "pattern", "action")
+        };
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|row| row[name] == permission && row[resource] == pattern)
+            .map(|row| row[action].as_str().unwrap().to_owned())
+    }
+    #[test]
+    fn read_only_opencode_runs_the_build_agent_not_plan() {
+        // Regression: read-only selected OpenCode's plan agent, which carries
+        // its planning prompt and its own permissions into read-only work.
+        assert_eq!(
+            prompt_agent(&settings(AccessMode::ReadOnly, false)),
+            "build"
+        );
+        let mut custom = settings(AccessMode::ReadOnly, false);
+        custom
+            .model_settings
+            .insert("agent".into(), "review".into());
+        assert_eq!(prompt_agent(&custom), "review");
+        custom.model_settings.insert("agent".into(), "plan".into());
+        assert_eq!(prompt_agent(&custom), "build");
+    }
+    #[test]
+    fn only_the_users_plan_choice_selects_the_opencode_plan_agent() {
+        for access in ACCESS {
+            assert_ne!(prompt_agent(&settings(access, false)), "plan", "{access:?}");
+            assert_eq!(prompt_agent(&settings(access, true)), "plan", "{access:?}");
+        }
+    }
+    #[test]
+    fn read_only_opencode_session_allows_reads_and_denies_edits_and_subagents() {
+        for (v2, shell, subagent) in [(false, "bash", "task"), (true, "shell", "subagent")] {
+            let rules = permissions(AccessMode::ReadOnly, v2);
+            assert_eq!(effect(&rules, v2, "*", "*").as_deref(), Some("ask"));
+            for tool in ["read", "glob", "grep"] {
+                assert_eq!(
+                    effect(&rules, v2, tool, "*").as_deref(),
+                    Some("allow"),
+                    "{tool}"
+                );
+            }
+            for command in READ_ONLY_COMMANDS {
+                assert_eq!(effect(&rules, v2, shell, command).as_deref(), Some("allow"));
+            }
+            assert_eq!(
+                effect(&rules, v2, shell, "*"),
+                None,
+                "other commands still ask"
+            );
+            assert_eq!(effect(&rules, v2, "edit", "*").as_deref(), Some("deny"));
+            assert_eq!(effect(&rules, v2, subagent, "*").as_deref(), Some("deny"));
+        }
+        // Other modes keep their rulesets.
+        let supervised = permissions(AccessMode::Supervised, false);
+        assert_eq!(effect(&supervised, false, "edit", "*"), None);
+        assert_eq!(effect(&supervised, false, "read", "*"), None);
+    }
+    #[test]
+    fn read_only_opencode_answers_permission_requests_with_the_read_only_rule() {
+        let read_only = settings(AccessMode::ReadOnly, false);
+        for action in ["read", "grep", "glob", "list"] {
+            assert_eq!(
+                auto_permission(&read_only, action, true),
+                Some(true),
+                "{action}"
+            );
+        }
+        for action in [
+            "bash",
+            "shell",
+            "edit",
+            "write",
+            "task",
+            "webfetch",
+            "external_directory",
+        ] {
+            assert_eq!(
+                auto_permission(&read_only, action, true),
+                Some(false),
+                "{action}"
+            );
+        }
+        // Supervised still asks; full access allows when someone can see it.
+        assert_eq!(
+            auto_permission(&settings(AccessMode::Supervised, false), "edit", true),
+            None
+        );
+        assert_eq!(
+            auto_permission(&settings(AccessMode::Supervised, false), "edit", false),
+            Some(false)
+        );
+        assert_eq!(
+            auto_permission(&settings(AccessMode::FullAccess, false), "edit", true),
+            Some(true)
+        );
+        assert_eq!(
+            auto_permission(&settings(AccessMode::FullAccess, true), "edit", true),
+            Some(false)
+        );
+    }
 }

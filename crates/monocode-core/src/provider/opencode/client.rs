@@ -425,35 +425,7 @@ impl Client {
         Ok(())
     }
     fn permissions(&self, request: &Request) -> Value {
-        let mut rules = if request.settings.access == AccessMode::FullAccess {
-            vec![("*", "allow")]
-        } else {
-            vec![("*", "ask"), ("question", "allow")]
-        };
-        if matches!(
-            request.settings.access,
-            AccessMode::AutoAcceptEdits | AccessMode::Auto
-        ) {
-            rules.push(("edit", "allow"));
-        }
-        if request.settings.access == AccessMode::Auto {
-            rules.push(("read", "allow"));
-        }
-        let rows: Vec<_> = rules
-            .into_iter()
-            .map(|(permission, action)| {
-                if self.v2 {
-                    json!({"action":permission,"resource":"*","effect":action})
-                } else {
-                    json!({"permission":permission,"pattern":"*","action":action})
-                }
-            })
-            .collect();
-        if self.v2 {
-            json!({"permissions":rows})
-        } else {
-            json!({"permission":rows})
-        }
+        permissions(request.settings.access, self.v2)
     }
     pub fn prompt(
         &self,
@@ -495,17 +467,7 @@ impl Client {
             };
             return Ok(result["id"].as_str().map(str::to_owned));
         }
-        let agent = if request.settings.plan || request.settings.access == AccessMode::ReadOnly {
-            "plan"
-        } else {
-            request
-                .settings
-                .model_settings
-                .get("agent")
-                .map(String::as_str)
-                .filter(|agent| *agent != "plan")
-                .unwrap_or("build")
-        };
+        let agent = prompt_agent(&request.settings);
         let parts = parts(request)?;
         let result = if self.v2 {
             self.request(
@@ -689,5 +651,86 @@ impl Read for HttpBody {
             self.separator = true;
         }
         Ok(bytes)
+    }
+}
+
+/// The OpenCode agent a prompt runs under. Only the user's plan choice
+/// (`settings.plan`) selects OpenCode's `plan` agent. Read-only is not plan
+/// mode: it runs the chosen agent (`build` by default) under the read-only
+/// session ruleset from `permissions`.
+pub(super) fn prompt_agent(settings: &Settings) -> &str {
+    if settings.plan {
+        return "plan";
+    }
+    settings
+        .model_settings
+        .get("agent")
+        .map(String::as_str)
+        .filter(|agent| *agent != "plan")
+        .unwrap_or("build")
+}
+
+/// Read-only Bash commands pre-approved for a read-only session, matching
+/// Claude's read-only `--allowedTools`. OpenCode's ` *` suffix also matches
+/// the bare command.
+pub(super) const READ_ONLY_COMMANDS: [&str; 7] = [
+    "git status *",
+    "git diff *",
+    "git log *",
+    "git show *",
+    "pwd",
+    "ls *",
+    "rg *",
+];
+
+/// The session permission ruleset for an access mode. OpenCode applies the
+/// last matching rule, and session rules come after the agent's.
+///
+/// Read-only allows reading and searching (`read`, `glob`, `grep`, `list`)
+/// and the read-only commands above, denies file edits and subagents, and
+/// leaves everything else at `ask`, which `events::auto_permission` denies
+/// unless it only reads.
+pub(super) fn permissions(access: AccessMode, v2: bool) -> Value {
+    let (shell, subagent) = if v2 {
+        ("shell", "subagent")
+    } else {
+        ("bash", "task")
+    };
+    let mut rules = if access == AccessMode::FullAccess {
+        vec![("*", "*", "allow")]
+    } else {
+        vec![("*", "*", "ask"), ("question", "*", "allow")]
+    };
+    if matches!(access, AccessMode::AutoAcceptEdits | AccessMode::Auto) {
+        rules.push(("edit", "*", "allow"));
+    }
+    if access == AccessMode::Auto {
+        rules.push(("read", "*", "allow"));
+    }
+    if access == AccessMode::ReadOnly {
+        for tool in ["read", "glob", "grep"] {
+            rules.push((tool, "*", "allow"));
+        }
+        if !v2 {
+            rules.push(("list", "*", "allow"));
+        }
+        rules.extend(READ_ONLY_COMMANDS.map(|command| (shell, command, "allow")));
+        rules.push(("edit", "*", "deny"));
+        rules.push((subagent, "*", "deny"));
+    }
+    let rows: Vec<_> = rules
+        .into_iter()
+        .map(|(permission, pattern, action)| {
+            if v2 {
+                json!({"action":permission,"resource":pattern,"effect":action})
+            } else {
+                json!({"permission":permission,"pattern":pattern,"action":action})
+            }
+        })
+        .collect();
+    if v2 {
+        json!({"permissions":rows})
+    } else {
+        json!({"permission":rows})
     }
 }
