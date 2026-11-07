@@ -75,9 +75,13 @@ impl AccessMode {
             ),
         }
     }
+    /// Claude's `--permission-mode`. Read-only is Claude's `default` mode with
+    /// a read-only tool set (see `provider::configure_claude_access`), never
+    /// `plan`: plan mode is the user's separate `/plan` choice, and it prompts
+    /// even for pre-approved tools such as a Mono's app tool.
     pub fn claude(self) -> &'static str {
         match self {
-            Self::ReadOnly => "plan",
+            Self::ReadOnly => "default",
             Self::Supervised => "default",
             Self::AutoAcceptEdits => "acceptEdits",
             Self::Auto => "auto",

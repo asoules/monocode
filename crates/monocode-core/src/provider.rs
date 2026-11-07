@@ -1375,6 +1375,77 @@ fn run_process(
     run_operation(request, cancel, controls, probe, false, false, emit)
 }
 
+/// Claude's permission mode, tool set, injected MCP servers and pre-approved
+/// tools for a session's settings.
+///
+/// Read-only is not Claude's plan mode: plan mode is the separate `/plan`
+/// feature (`settings.plan`), and in it Claude asks before every tool that is
+/// not read-only, even one listed in `--allowedTools`. A read-only session
+/// therefore runs in Claude's `default` mode with the tool set narrowed to
+/// reading and searching, so file edits are unavailable, unlisted shell
+/// commands still raise a permission request (which read-only denies in
+/// `Protocol::approval`), and the pre-approved Monocode MCP tools run without
+/// one.
+fn configure_claude_access(command: &mut Command, settings: &Settings) {
+    let mode = if settings.plan {
+        "plan"
+    } else {
+        settings.access.claude()
+    };
+    command.args(["--permission-mode", mode]);
+    if settings.text_only {
+        command.args([
+            "--tools",
+            "",
+            "--max-turns",
+            "1",
+            "--no-session-persistence",
+            "--strict-mcp-config",
+            "--mcp-config",
+            "{\"mcpServers\":{}}",
+        ]);
+    }
+    let visual_server = (!settings.text_only)
+        .then(|| crate::visual_bridge::mcp_server(&settings.environment))
+        .flatten();
+    let mut allowed = Vec::new();
+    if !settings.text_only && settings.access == AccessMode::ReadOnly {
+        command.args(["--tools", "Read,Glob,Grep,Bash"]);
+        allowed.push("Read,Glob,Grep,Bash(git status *),Bash(git diff *),Bash(git log *),Bash(git show *),Bash(pwd),Bash(ls *),Bash(rg *)");
+    }
+    let app_server = (!settings.text_only)
+        .then(|| crate::mono::bridge::mcp_server(settings.mono.as_ref(), &settings.environment))
+        .flatten();
+    let mut servers = serde_json::Map::new();
+    if let Some(server) = app_server {
+        servers.insert(crate::mono::bridge::MCP_SERVER.into(), server);
+        allowed.push(crate::mono::bridge::CLAUDE_ALLOWED_TOOLS);
+    }
+    let mut system = Vec::new();
+    if let Some(mono) = settings.mono.as_ref().filter(|_| !settings.text_only) {
+        system.push(crate::mono::instructions(&mono.mono, &mono.executable));
+    }
+    if let Some(server) = visual_server {
+        servers.insert("monocode_visual".into(), server);
+        allowed.push(crate::visual_bridge::CLAUDE_ALLOWED_TOOLS);
+        if let Some(instructions) = crate::visual_bridge::instructions(&settings.environment, true)
+        {
+            system.push(instructions);
+        }
+    }
+    if !system.is_empty() {
+        command.args(["--append-system-prompt", &system.join("\n\n")]);
+    }
+    if !servers.is_empty() {
+        command.args(["--mcp-config", &json!({"mcpServers":servers}).to_string()]);
+    }
+    if !allowed.is_empty() {
+        command.args(["--allowedTools", &allowed.join(",")]);
+    }
+    if mode == "bypassPermissions" {
+        command.arg("--allow-dangerously-skip-permissions");
+    }
+}
 fn run_operation(
     request: Request,
     cancel: Arc<AtomicBool>,
@@ -1442,67 +1513,7 @@ fn run_operation(
                 "stdio",
             ]);
             let settings = &request.settings;
-            let mode = if settings.plan {
-                "plan"
-            } else {
-                settings.access.claude()
-            };
-            command.args(["--permission-mode", mode]);
-            if settings.text_only {
-                command.args([
-                    "--tools",
-                    "",
-                    "--max-turns",
-                    "1",
-                    "--no-session-persistence",
-                    "--strict-mcp-config",
-                    "--mcp-config",
-                    "{\"mcpServers\":{}}",
-                ]);
-            }
-            let visual_server = (!settings.text_only)
-                .then(|| crate::visual_bridge::mcp_server(&settings.environment))
-                .flatten();
-            let mut allowed = Vec::new();
-            if !settings.text_only && settings.access == AccessMode::ReadOnly {
-                command.args(["--tools", "Read,Glob,Grep,Bash"]);
-                allowed.push("Read,Glob,Grep,Bash(git status *),Bash(git diff *),Bash(git log *),Bash(git show *),Bash(pwd),Bash(ls *),Bash(rg *)");
-            }
-            let app_server = (!settings.text_only)
-                .then(|| {
-                    crate::mono::bridge::mcp_server(settings.mono.as_ref(), &settings.environment)
-                })
-                .flatten();
-            let mut servers = serde_json::Map::new();
-            if let Some(server) = app_server {
-                servers.insert(crate::mono::bridge::MCP_SERVER.into(), server);
-                allowed.push(crate::mono::bridge::CLAUDE_ALLOWED_TOOLS);
-            }
-            let mut system = Vec::new();
-            if let Some(mono) = settings.mono.as_ref().filter(|_| !settings.text_only) {
-                system.push(crate::mono::instructions(&mono.mono, &mono.executable));
-            }
-            if let Some(server) = visual_server {
-                servers.insert("monocode_visual".into(), server);
-                allowed.push(crate::visual_bridge::CLAUDE_ALLOWED_TOOLS);
-                if let Some(instructions) =
-                    crate::visual_bridge::instructions(&settings.environment, true)
-                {
-                    system.push(instructions);
-                }
-            }
-            if !system.is_empty() {
-                command.args(["--append-system-prompt", &system.join("\n\n")]);
-            }
-            if !servers.is_empty() {
-                command.args(["--mcp-config", &json!({"mcpServers":servers}).to_string()]);
-            }
-            if !allowed.is_empty() {
-                command.args(["--allowedTools", &allowed.join(",")]);
-            }
-            if mode == "bypassPermissions" {
-                command.arg("--allow-dangerously-skip-permissions");
-            }
+            configure_claude_access(&mut command, settings);
             let mut config = json!({});
             if settings.disable_claude_hooks || settings.text_only {
                 config["disableAllHooks"] = true.into();
@@ -1880,6 +1891,113 @@ fn run_operation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A Mono session's settings with the app and visual bridges configured,
+    /// as its main chat, thread side sessions and habit runs carry them.
+    fn bridged_settings(access: AccessMode) -> Settings {
+        let mut settings = Settings {
+            access,
+            mono: Some(crate::agent::MonoContext {
+                mono: Default::default(),
+                root: "/monos".into(),
+                executable: "/bin/monocode-gpui".into(),
+            }),
+            ..Default::default()
+        };
+        for key in [
+            "MONOCODE_APP_ENDPOINT",
+            "MONOCODE_APP_TOKEN",
+            "MONOCODE_APP_SESSION",
+            "MONOCODE_VISUAL_ENDPOINT",
+            "MONOCODE_VISUAL_TOKEN",
+            "MONOCODE_VISUAL_SESSION",
+            "MONOCODE_VISUAL_EXECUTABLE",
+        ] {
+            settings.environment.insert(key.into(), "set".into());
+        }
+        settings
+    }
+    fn claude_args(settings: &Settings) -> Vec<String> {
+        let mut command = Command::new("claude");
+        configure_claude_access(&mut command, settings);
+        command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+    fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+        args.iter()
+            .position(|arg| arg == name)
+            .and_then(|i| args.get(i + 1))
+            .map(String::as_str)
+    }
+    #[test]
+    fn read_only_claude_uses_default_mode_with_read_tools_and_pre_approved_mcp() {
+        // Regression: read-only mapped to plan mode, where Claude asks before
+        // even pre-approved tools and a hidden thread session's
+        // threads.react was answered "Denied by the user".
+        let args = claude_args(&bridged_settings(AccessMode::ReadOnly));
+        assert_eq!(flag(&args, "--permission-mode"), Some("default"));
+        assert_eq!(flag(&args, "--tools"), Some("Read,Glob,Grep,Bash"));
+        let allowed = flag(&args, "--allowedTools").unwrap();
+        let allowed: Vec<_> = allowed.split(',').collect();
+        for tool in [
+            "mcp__monocode_app",
+            "mcp__monocode_visual",
+            "Read",
+            "Bash(git diff *)",
+        ] {
+            assert!(allowed.contains(&tool), "{tool} pre-approved: {allowed:?}");
+        }
+        // Edits and arbitrary commands are never pre-approved.
+        for tool in ["Bash", "Edit", "Write"] {
+            assert!(!allowed.contains(&tool), "{tool} must not be pre-approved");
+        }
+        assert!(flag(&args, "--mcp-config")
+            .unwrap()
+            .contains("monocode_app"));
+        assert!(!args
+            .iter()
+            .any(|arg| arg == "--allow-dangerously-skip-permissions"));
+    }
+    #[test]
+    fn only_the_users_plan_choice_selects_claude_plan_mode() {
+        for access in [
+            AccessMode::ReadOnly,
+            AccessMode::Supervised,
+            AccessMode::AutoAcceptEdits,
+            AccessMode::Auto,
+            AccessMode::FullAccess,
+        ] {
+            let mut settings = bridged_settings(access);
+            assert_ne!(
+                flag(&claude_args(&settings), "--permission-mode"),
+                Some("plan"),
+                "{access:?}"
+            );
+            settings.plan = true;
+            let args = claude_args(&settings);
+            assert_eq!(flag(&args, "--permission-mode"), Some("plan"), "{access:?}");
+            assert!(flag(&args, "--allowedTools")
+                .unwrap()
+                .contains("mcp__monocode_app"));
+        }
+        let mut settings = bridged_settings(AccessMode::Supervised);
+        let args = claude_args(&settings);
+        assert_eq!(flag(&args, "--tools"), None);
+        settings.plan = true;
+        assert_eq!(flag(&claude_args(&settings), "--tools"), None);
+    }
+    #[test]
+    fn read_only_claude_still_denies_unlisted_commands_without_asking() {
+        let mut claude = protocol(Kind::Claude);
+        claude.request.settings = bridged_settings(AccessMode::ReadOnly);
+        let mut out = Vec::new();
+        let events = claude.frame(json!({"type":"control_request","request_id":"rm","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"rm -rf src"}}}), &mut out).unwrap();
+        assert!(!events.iter().any(|e| matches!(e, Event::Approval(_))));
+        let response: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(response["response"]["request_id"], "rm");
+        assert_eq!(response["response"]["response"]["behavior"], "deny");
+    }
     fn protocol(kind: Kind) -> Protocol {
         Protocol::new(Request {
             kind,
