@@ -277,6 +277,7 @@ impl Monos {
         self.roster.monos.retain(|m| m.id != id);
         if self.active.as_deref() == Some(id) {
             self.active = None;
+            self.forget_readers();
         }
         self.save(cx);
     }
